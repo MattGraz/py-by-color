@@ -161,7 +161,7 @@ def remove_single_pixels(image: Image) -> Image:
 
 
 def smooth_small_polygons(image: Image, min_pixels: int = 10):
-    image_adj
+    # image_adj
     # For all pixels, remove groups of pixels that are not of some minimum number of pixels
     # Impute these groups with most prevelant local color
 
@@ -169,6 +169,7 @@ def smooth_small_polygons(image: Image, min_pixels: int = 10):
     #   (1) Identify groups of pixels that are in groups less than min_pixels
     #   (2) Imputes these pixels with the most prevelant local color
     #           - Need some filter to identify the most preveland local color
+    pass
 
 
 def convert_image_to_shapes(image: Image, available_colors: Dict) -> gpd.GeoDataFrame:
@@ -200,7 +201,7 @@ def convert_image_to_shapes(image: Image, available_colors: Dict) -> gpd.GeoData
     return all_geo
 
 
-def smooth_image(image: image, iter=3) -> image:
+def smooth_image(image: Image, iter=3) -> Image:
     for _ in range(0, iter):
         image = image.filter(SMOOTH_MORE)
     return image
