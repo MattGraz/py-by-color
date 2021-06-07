@@ -1,20 +1,23 @@
-import json
+import argparse
+
 from collections import Counter
 from itertools import permutations
 from typing import Dict
 
 import geopandas as gpd
 import numpy as np
-import pandas as pd
-from matplotlib import pyplot as plt
+from pandas import concat
 from PIL import Image
-from PIL.ImageFilter import SMOOTH, SMOOTH_MORE
+from PIL.ImageFilter import SMOOTH_MORE
 from rasterio.features import shapes
 from scipy.spatial.distance import euclidean
 from shapely.geometry import Polygon
 from sklearn.cluster import KMeans
 from sklearn.neighbors import KNeighborsClassifier
 from tqdm import tqdm
+
+from qgis.core import *
+from PyQt5.QtGui import QFont, QColor
 
 # AVAILABLE_COLORS = {
 #      1: [228, 23, 23],  # Red-ish,
@@ -56,7 +59,6 @@ def open_image(path: str) -> Image:
 
 def get_available_colors(image: Image, n_colors=15):
     pixels = list(image.getdata())
-    pixel_colors_counts = Counter(pixels)
 
     # Cluster (Kmeans) pixels to identify "mean" color of each cluster
     km = KMeans(n_clusters=n_colors, verbose=1, random_state=100, n_jobs=8)
@@ -161,7 +163,6 @@ def remove_single_pixels(image: Image) -> Image:
 
 
 def smooth_small_polygons(image: Image, min_pixels: int = 10):
-    image_adj
     # For all pixels, remove groups of pixels that are not of some minimum number of pixels
     # Impute these groups with most prevelant local color
 
@@ -169,6 +170,7 @@ def smooth_small_polygons(image: Image, min_pixels: int = 10):
     #   (1) Identify groups of pixels that are in groups less than min_pixels
     #   (2) Imputes these pixels with the most prevelant local color
     #           - Need some filter to identify the most preveland local color
+    return image
 
 
 def convert_image_to_shapes(image: Image, available_colors: Dict) -> gpd.GeoDataFrame:
@@ -189,6 +191,7 @@ def convert_image_to_shapes(image: Image, available_colors: Dict) -> gpd.GeoData
                 geo = gpd.GeoDataFrame(
                     geometry=[Polygon(s) for s in shape_iter[0]["coordinates"]]
                 )
+                geo["color_index"] = color_id_for_mask[0]
                 geo["color_name"] = str(color_for_mask)
 
                 # Set value to color
@@ -196,30 +199,162 @@ def convert_image_to_shapes(image: Image, available_colors: Dict) -> gpd.GeoData
                 # keep_shapes.append(shape_iter[0])
                 keep_shapes.append(geo)
 
-    all_geo = pd.concat(keep_shapes)
+    all_geo = concat(keep_shapes)
     return all_geo
 
 
-def smooth_image(image: image, iter=3) -> image:
+def clean_shapes(gdf, percentile_threshhold=.65, drop_duplicates=True):
+
+    # Drop shapes with area less than nth percentile; Removes lots of really small shapes
+    nth_percentile = gdf.geometry.area.quantile(percentile_threshhold)
+    gdf = gdf[gdf.geometry.area > nth_percentile]
+    
+    # NOTE: buffer(0) is intentional, as this corrects invalid polygons
+    gdf['geometry'] = gdf['geometry'].buffer(0)
+
+    if drop_duplicates:
+        # Identify and Drop duplicate shapes (may have different colors)
+        #   Just randomly pick one to drop for now
+        # TODO: Why/How do these duplicate shapes get created?
+        for row_iter in tqdm(gdf.iterrows(), total=gdf.shape[0]):
+            shape_iter = row_iter[1].geometry
+            color_iter = row_iter[1].color_index
+
+            equal_shapes = gdf[gdf.geometry == shape_iter]
+
+            if equal_shapes.shape[0] > 1:
+                print("Dropping")
+                gdf = gdf[~((gdf.geometry == shape_iter) & (gdf.color_index == color_iter))]
+
+    return gdf
+
+
+def smooth_image(image: Image, iter=3) -> Image:
     for _ in range(0, iter):
         image = image.filter(SMOOTH_MORE)
     return image
 
 
+def read_layer(path: str, name: str="mygeo"):
+
+    # Create new layer from geojson
+    vlayer = QgsVectorLayer(path, name)
+    if not vlayer.isValid():
+        print("Layer failed to load!")
+
+    # Print additional available attributes
+    for field in vlayer.fields():
+        print(field.name(), field.typeName())
+
+    return vlayer 
+
+
+def format_layer(layer):
+
+    # layer = qgis.utils.iface.mapCanvas().currentLayer()
+
+    layer.startEditing()
+    registry = QgsSymbolLayerRegistry()
+    lineMeta = registry.symbolLayerMetadata("SimpleLine")
+    symbol = QgsSymbol.defaultSymbol(layer.geometryType())
+
+
+    # Line layer
+    lineLayer = lineMeta.createSymbolLayer({'width': '0.05',  # mm
+                                            'color': '0, 0, 0',  # black
+                                            'offset': '0',
+                                            'penstyle': 'solid',
+                                            'use_custom_dash': '0',
+                                            'joinstyle': 'bevel',
+                                            'capstyle': 'square'})
+
+    # Replace the default layer with our two custom layers
+    symbol.deleteSymbolLayer(0)
+    symbol.appendSymbolLayer(lineLayer)
+    # symbol.appendSymbolLayer(markerLayer)
+
+    # Replace the renderer of the current layer
+    renderer = QgsSingleSymbolRenderer(symbol)
+    layer.setRenderer(renderer)
+
+    # Set labels to be the color index
+    layer_settings  = QgsPalLayerSettings()
+    text_format = QgsTextFormat()
+
+    text_format.setFont(QFont("Arial", 5))
+    text_format.setSize(5)
+
+    buffer_settings = QgsTextBufferSettings()
+    buffer_settings.setEnabled(True)
+    buffer_settings.setSize(0)
+    buffer_settings.setColor(QColor("gray"))
+
+    text_format.setBuffer(buffer_settings)
+    layer_settings.setFormat(text_format)
+
+    layer_settings.fieldName = "color_index"
+    layer_settings.placement = 2
+    layer_settings.enabled = True
+
+    layer_settings = QgsVectorLayerSimpleLabeling(layer_settings)
+    layer.setLabelsEnabled(True)
+    layer.setLabeling(layer_settings)
+    
+    layer.commitChanges()
+
+    return layer
+    
+
 def main():
+    
+    # create parser
+    parser = argparse.ArgumentParser()
+    
+    # add arguments to the parser
+    
+    parser.add_argument('--input_path', help='Path to input file (jpg, png)')
+    parser.add_argument("--layer_name", default="picture_layer", help="Name of layer in qgis layer")
+    parser.add_argument('--output_path', default="data/output.qgs", help='Path to input file (jpg, png)')
+    
+    # parse the arguments
+    args = parser.parse_args()
+
     image = open_image("data/yosemite_small.png")
     available_colors = get_available_colors(image, 15)
     image = smooth_image(
-        image, 2
+        image, 4
     )  # Helpful when there are very fine details; Can I programatically identify?
     pixel_to_color_dict = map_real_colors_to_available_colors(image, available_colors)
     image_adj = convert_image_to_available_colors(image, pixel_to_color_dict)
     image_adj_new = remove_single_pixels(image_adj)
     image_adj_gdf = convert_image_to_shapes(image_adj_new, available_colors)
-    image_adj_gdf.to_file("test_geopandas.geojson", driver="GeoJSON")
-    # image_adj_gdf.plot()
-    # plt.show()
+    image_adj_gdf = clean_shapes(image_adj_gdf.copy())
 
+    # Write to geojson
+    image_adj_gdf.reset_index(drop=True).to_file("test_geopandas.geojson", driver="GeoJSON")
+
+    # Initialize QGIS Application 
+    # NOTE: The initialization MUST happen globally and not in a function or 
+    #   several things (reading shapes), (defining layouts) results in seg faults
+    gui_flag=False
+    qgs = QgsApplication([], gui_flag)
+    QgsApplication.setPrefixPath("/usr/local/Caskroom/miniconda/base/envs/qgis/bin/qgis", True)
+    QgsApplication.initQgis()
+    for alg in QgsApplication.processingRegistry().algorithms():
+        print(alg.id(), "->", alg.displayName())
+
+    vlayer = read_layer("test_geopandas.geojson", "PleaseWork")
+    vlayer_adj = format_layer(vlayer)
+
+    project = QgsProject.instance()         
+    # manager = project.layoutManager()       
+    # layout = QgsPrintLayout(project)   
+    project.addMapLayer(vlayer_adj)
+    # exporter = QgsLayoutExporter(layout)                
+    # exporter.exportToPdf('hope_it_worked.pdf', QgsLayoutExporter.PdfExportSettings())      
+
+    # WRITE OUT A QGIS PROJECT FILE
+    project.write("WORK_PLEASE_new_label_again_again.qgs")
 
 if __name__ == "__main__":
     main()
